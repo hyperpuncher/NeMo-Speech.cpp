@@ -25,6 +25,10 @@ column lists the short flag where one exists - the dotted form
 | `asr.backend.gpu` | `--gpu`, `-g` | `0` | GPU index; `-1` = CPU |
 | `asr.model.path` | - | - | model GGUF path (required for ASR) |
 | `asr.model.name` | - | derived | display-name override |
+| `asr.offline.chunk_ms` | - | `20000` | owned TDT chunk duration for bounded long-form inference; `0` disables |
+| `asr.offline.context_ms` | - | `3500` | encoder context added on each side of a long-form TDT chunk |
+| `asr.offline.min_long_form_ms` | - | `180000` | minimum TDT recording duration before bounded inference activates |
+| `asr.offline.retry_collapsed_windows` | - | `true` | confirm and retry anomalously incomplete TDT windows |
 | `asr.streaming.chunk_size` | `--chunk-sec` | `0.16` | CTC buffered window (s) |
 | `asr.streaming.ctc_left_padding` | `--left-pad-sec` | `1.92` | CTC left context (s) |
 | `asr.streaming.ctc_right_padding` | `--right-pad-sec` | `1.92` | CTC right context (s) |
@@ -77,6 +81,17 @@ column lists the short flag where one exists - the dotted form
 
 The examples below use short aliases for brevity; each maps to the dotted key and
 works identically in YAML.
+
+Offline TDT recordings at least `min_long_form_ms` long use fixed-size
+overlapping encoder windows. Each window is decoded independently, and word emission
+times assign overlap words to one owned chunk. This bounds graph memory by the window
+size instead of the recording duration. Short recordings retain full-utterance
+inference. RNNT, CTC, and streaming recognition keep their existing execution paths.
+
+When `retry_collapsed_windows` is enabled, a long emission gap triggers shifted
+window checks. A retry is accepted only when two shifted windows independently
+produce materially more owned words. This targets TDT deletion collapses without
+replacing low-density speech or silence from one outlying decode.
 
 Batching is off by default to preserve local B=1 latency. High-concurrency workloads
 can enable it with `--asr.batching.enabled true`; the default 5 ms neural queue

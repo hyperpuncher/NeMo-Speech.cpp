@@ -17,6 +17,12 @@ asr:
     path: /models/nemotron-speech-streaming-en-0.6b.q8_0.gguf
     # name:                      # display name; default is derived from the model
 
+  offline:                       # bounded long-form TDT inference
+    chunk_ms: 20000              # owned window duration; 0 disables chunking
+    context_ms: 3500             # encoder context on each side of a window
+    min_long_form_ms: 180000     # keep full-utterance inference below 3 minutes
+    retry_collapsed_windows: true # confirm and retry anomalously incomplete windows
+
   streaming:
     chunk_size: 0.16             # CTC buffered window (seconds)
     ctc_left_padding: 1.92       # CTC left context (seconds)
