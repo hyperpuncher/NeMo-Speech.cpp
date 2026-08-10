@@ -596,6 +596,105 @@ BufferedStreamRunner::process_window(size_t win_start, size_t win_end, bool is_l
     return update;
 }
 
+std::vector<offline_detail::Window>
+offline_detail::make_windows(
+    size_t audio_samples, size_t chunk_samples, size_t context_samples,
+    size_t min_long_form_samples) {
+    const size_t window_samples = chunk_samples + 2 * context_samples;
+    const size_t activation_samples = std::max(window_samples, min_long_form_samples);
+    if (chunk_samples == 0 || audio_samples < activation_samples)
+        return {{0, audio_samples, 0, audio_samples}};
+
+    std::vector<Window> windows;
+    const size_t latest_window_start = audio_samples - window_samples;
+    for (size_t core_start = 0; core_start < audio_samples; core_start += chunk_samples) {
+        const size_t core_end = std::min(core_start + chunk_samples, audio_samples);
+        const size_t preferred_start =
+            core_start > context_samples ? core_start - context_samples : 0;
+        const size_t input_start = std::min(preferred_start, latest_window_start);
+        windows.push_back(
+            {input_start, window_samples, core_start - input_start, core_end - core_start});
+    }
+    return windows;
+}
+
+offline_detail::Window
+offline_detail::shift_window(const Window& window, size_t audio_samples, int64_t shift_samples) {
+    const size_t core_start = window.input_offset + window.owned_offset;
+    const size_t core_end = core_start + window.owned_samples;
+    const size_t latest_window_start = audio_samples - window.input_samples;
+    const size_t earliest = core_end > window.input_samples ? core_end - window.input_samples : 0;
+    const size_t latest = std::min(core_start, latest_window_start);
+    const int64_t proposed = static_cast<int64_t>(window.input_offset) + shift_samples;
+    const size_t input_start = static_cast<size_t>(
+        std::clamp(proposed, static_cast<int64_t>(earliest), static_cast<int64_t>(latest)));
+    return {input_start, window.input_samples, core_start - input_start, window.owned_samples};
+}
+
+bool
+offline_detail::has_large_emission_gap(
+    const std::vector<WordTiming>& words, int owned_begin, int owned_end, int gap_frames) {
+    if (owned_end <= owned_begin || gap_frames <= 0)
+        return false;
+    int cursor = owned_begin;
+    for (const auto& word : words) {
+        const int start =
+            static_cast<int>(std::clamp<int64_t>(word.start_frame, owned_begin, owned_end));
+        const int end = static_cast<int>(std::clamp<int64_t>(word.end_frame, start, owned_end));
+        if (start - cursor >= gap_frames)
+            return true;
+        cursor = std::max(cursor, end);
+    }
+    return owned_end - cursor >= gap_frames;
+}
+
+bool
+offline_detail::materially_more_words(size_t base_words, size_t candidate_words) {
+    return candidate_words >= base_words + 8 && candidate_words * 2 >= base_words * 3;
+}
+
+int
+offline_detail::select_consensus_retry(
+    size_t base_words, const std::vector<size_t>& candidate_words) {
+    std::vector<size_t> qualifying;
+    for (size_t i = 0; i < candidate_words.size(); ++i) {
+        if (materially_more_words(base_words, candidate_words[i]))
+            qualifying.push_back(i);
+    }
+    if (qualifying.size() < 2)
+        return -1;
+
+    std::vector<size_t> supported;
+    for (const size_t i : qualifying) {
+        for (const size_t j : qualifying) {
+            if (i == j)
+                continue;
+            const size_t high = std::max(candidate_words[i], candidate_words[j]);
+            const size_t low = std::min(candidate_words[i], candidate_words[j]);
+            if (high - low <= std::max<size_t>(3, (high + 9) / 10)) {
+                supported.push_back(i);
+                break;
+            }
+        }
+    }
+    if (supported.size() < 2)
+        return -1;
+
+    std::vector<size_t> counts;
+    counts.reserve(supported.size());
+    for (const size_t i : supported) counts.push_back(candidate_words[i]);
+    std::sort(counts.begin(), counts.end());
+    const size_t target = counts[counts.size() / 2];
+    return static_cast<int>(
+        *std::min_element(supported.begin(), supported.end(), [&](size_t a, size_t b) {
+            const size_t da = candidate_words[a] > target ? candidate_words[a] - target
+                                                          : target - candidate_words[a];
+            const size_t db = candidate_words[b] > target ? candidate_words[b] - target
+                                                          : target - candidate_words[b];
+            return da != db ? da < db : a < b;
+        }));
+}
+
 OfflineRunner::OfflineRunner(
     AsrModel* model, const RecognizerConfig& cfg,
     std::shared_ptr<const FlashlightResources> flashlight)
@@ -605,6 +704,26 @@ OfflineRunner::OfflineRunner(
     if (cfg.batching.offline_bucket_ms > 0) {
         bucket_samples_ = static_cast<size_t>(cfg.batching.offline_bucket_ms) *
                           static_cast<size_t>(model_->sample_rate()) / 1000;
+    }
+    if (cfg.offline.chunk_ms < 0)
+        throw std::invalid_argument("offline.chunk_ms must be non-negative");
+    if (cfg.offline.context_ms < 0)
+        throw std::invalid_argument("offline.context_ms must be non-negative");
+    if (cfg.offline.min_long_form_ms < 0)
+        throw std::invalid_argument("offline.min_long_form_ms must be non-negative");
+    if (cfg.offline.chunk_ms > 0 && model_->head_kind() == HeadKind::Tdt) {
+        const size_t samples_per_ms = static_cast<size_t>(model_->sample_rate()) / 1000;
+        tdt_chunk_samples_ = static_cast<size_t>(cfg.offline.chunk_ms) * samples_per_ms;
+        tdt_context_samples_ = static_cast<size_t>(cfg.offline.context_ms) * samples_per_ms;
+        tdt_min_long_form_samples_ =
+            static_cast<size_t>(cfg.offline.min_long_form_ms) * samples_per_ms;
+        retry_collapsed_tdt_windows_ = cfg.offline.retry_collapsed_windows;
+        const size_t window_samples = tdt_chunk_samples_ + 2 * tdt_context_samples_;
+        if (window_samples < tdt_chunk_samples_ ||
+            exceeds_offline_position_limit(*model_, window_samples, model_->sample_rate())) {
+            throw std::invalid_argument(
+                "offline chunk plus context exceeds the model position limit");
+        }
     }
     if (model_->head_kind() == HeadKind::Ctc)
         ctc_decoder_ = make_ctc_decoder(static_cast<CtcModel*>(model_), cfg, std::move(flashlight));
@@ -697,22 +816,24 @@ OfflineRunner::finalize() {
         static_cast<float>(audio_.size()) / static_cast<float>(model_->sample_rate());
     if (audio_.empty())
         return update;
+    const size_t unpadded_samples = audio_.size();
     pad_audio_to_bucket_();
 
-    // Audio past the positional-encoding budget is split at quiet points and
-    // decoded segment by segment through one stateful decoder with cumulative
-    // frame offsets - the same contract the streaming runners use, so
-    // transcripts and word timings stitch without any seam handling here.
-    const auto segments = offline_segments_();
+    // CTC audio past the positional-encoding budget is split at quiet points.
+    // When bounded TDT inference is enabled, overlapping windows are decoded
+    // independently and words are assigned by their emission midpoint.
     std::unique_ptr<Decoder> owned_decoder;
     Decoder* decoder = nullptr;
     std::vector<int> tokens;
+    std::vector<WordTiming> stitched_words;
+    bool bounded_tdt = false;
     if (model_->head_kind() == HeadKind::Ctc) {
         auto* ctc = static_cast<CtcModel*>(model_);
         decoder = ctc_decoder_.get();
         decoder->set_compute_timestamps(opts_.enable_word_time_offsets);
         decoder->set_request_options(opts_);
         int64_t frame_offset = 0;
+        const auto segments = offline_segments_();
         for (const auto& [off, len] : segments) {
             std::vector<int> seg_tokens;
             if (auto* greedy = dynamic_cast<GreedyCtcDecoder*>(decoder)) {
@@ -734,10 +855,6 @@ OfflineRunner::finalize() {
         }
     } else {
         auto* transducer = static_cast<RnntModel*>(model_);
-        owned_decoder = transducer->make_transducer_decoder(decoder_cfg_);
-        decoder = owned_decoder.get();
-        decoder->set_compute_timestamps(opts_.enable_word_time_offsets);
-        decoder->set_request_options(opts_);
         // Full-utterance Recognize presents every encoder frame in this one
         // call. The EOU punctuation floor is designed for the short trailing
         // chunk of a streaming flush; enabling it here biases '.', '?', and
@@ -746,36 +863,241 @@ OfflineRunner::finalize() {
         // applies no such bias, and this model already self-punctuates.
         const auto decode_begin = std::chrono::steady_clock::now();
         int64_t frame_offset = 0;
-        for (const auto& [off, len] : segments) {
-            std::vector<float> enc;
-            int T = 0;
-            transducer->infer_offline(audio_.data() + off, len, enc, T, prompt_index_);
-            auto seg_tokens =
-                decoder->step(enc.data(), transducer->rnnt_config().joint_dim, T, frame_offset);
-            frame_offset += T;
-            tokens.insert(tokens.end(), seg_tokens.begin(), seg_tokens.end());
+        const size_t window_samples = tdt_chunk_samples_ + 2 * tdt_context_samples_;
+        bounded_tdt = tdt_chunk_samples_ > 0 &&
+                      unpadded_samples >= std::max(window_samples, tdt_min_long_form_samples_);
+        size_t segment_count = 0;
+        size_t retry_passes = 0;
+        size_t accepted_retries = 0;
+        if (!bounded_tdt) {
+            owned_decoder = transducer->make_transducer_decoder(decoder_cfg_);
+            decoder = owned_decoder.get();
+            decoder->set_compute_timestamps(opts_.enable_word_time_offsets);
+            decoder->set_request_options(opts_);
+            const auto segments = offline_segments_();
+            segment_count = segments.size();
+            for (const auto& [offset, samples] : segments) {
+                std::vector<float> enc;
+                int T = 0;
+                transducer->infer_offline(audio_.data() + offset, samples, enc, T, prompt_index_);
+                auto emitted =
+                    decoder->step(enc.data(), transducer->rnnt_config().joint_dim, T, frame_offset);
+                tokens.insert(tokens.end(), emitted.begin(), emitted.end());
+                frame_offset += T;
+            }
+        } else {
+            const auto windows = offline_detail::make_windows(
+                unpadded_samples, tdt_chunk_samples_, tdt_context_samples_,
+                tdt_min_long_form_samples_);
+            segment_count = windows.size();
+            const size_t samples_per_frame = static_cast<size_t>(model_->subsampling_factor()) *
+                                             static_cast<size_t>(model_->fe().hop_length());
+            const auto to_frame = [&](size_t samples) {
+                return static_cast<int>((samples + samples_per_frame / 2) / samples_per_frame);
+            };
+
+            struct DecodedWindow {
+                std::vector<int> tokens;
+                std::vector<WordTiming> words;
+                int owned_begin = 0;
+                int owned_end = 0;
+                int64_t global_base = 0;
+            };
+            const auto decode_window = [&](const offline_detail::Window& window) {
+                DecodedWindow result;
+                auto window_decoder = transducer->make_transducer_decoder(decoder_cfg_);
+                auto* window_head = window_decoder.get();
+                window_head->set_compute_timestamps(true);
+                window_head->set_request_options(opts_);
+
+                std::vector<float> enc;
+                int T = 0;
+                transducer->infer_offline(
+                    audio_.data() + window.input_offset, window.input_samples, enc, T,
+                    prompt_index_);
+                result.owned_begin = std::clamp(to_frame(window.owned_offset), 0, T);
+                result.owned_end = std::clamp(
+                    to_frame(window.owned_offset + window.owned_samples), result.owned_begin, T);
+                result.global_base = static_cast<int64_t>(
+                    (window.input_offset + samples_per_frame / 2) / samples_per_frame);
+
+                auto seg_tokens =
+                    window_head->step(enc.data(), transducer->rnnt_config().joint_dim, T, 0);
+                window_head->finalize();
+                const auto& token_frames = window_head->token_frames();
+                if (token_frames.size() != seg_tokens.size())
+                    throw std::runtime_error("TDT decoder did not report token emission frames");
+                for (size_t i = 0; i < seg_tokens.size(); ++i) {
+                    if (token_frames[i] >= result.owned_begin && token_frames[i] < result.owned_end)
+                        result.tokens.push_back(seg_tokens[i]);
+                }
+
+                std::vector<WordTiming> all_words;
+                WordTiming current_word;
+                bool word_open = false;
+                const auto flush_word = [&]() {
+                    if (word_open && !current_word.word.empty())
+                        all_words.push_back(std::move(current_word));
+                    current_word = {};
+                    word_open = false;
+                };
+                for (size_t i = 0; i < seg_tokens.size(); ++i) {
+                    const int token = seg_tokens[i];
+                    if (token < 0 || token >= static_cast<int>(window_head->vocab().size()))
+                        continue;
+                    const auto& piece = window_head->vocab()[static_cast<size_t>(token)];
+                    if (sp_starts_new_word(piece) || !word_open) {
+                        flush_word();
+                        word_open = true;
+                        current_word.start_frame = token_frames[i];
+                        current_word.confidence = 1.0f;
+                    }
+                    current_word.word += sp_piece_text(piece);
+                    current_word.end_frame = token_frames[i] + 1;
+                }
+                flush_word();
+                for (auto word : all_words) {
+                    const int64_t midpoint =
+                        word.start_frame + (word.end_frame - word.start_frame) / 2;
+                    if (midpoint < result.owned_begin || midpoint >= result.owned_end)
+                        continue;
+                    word.start_frame = std::max<int64_t>(word.start_frame, result.owned_begin);
+                    word.end_frame = std::min<int64_t>(word.end_frame, result.owned_end);
+                    result.words.push_back(std::move(word));
+                }
+                return result;
+            };
+
+            constexpr int kRetryGapMs = 7000;
+            constexpr int kRetryShiftMs = 1000;
+            const int gap_frames = to_frame(
+                static_cast<size_t>(kRetryGapMs) * static_cast<size_t>(model_->sample_rate()) /
+                1000);
+            const int64_t retry_shift_samples =
+                static_cast<int64_t>(kRetryShiftMs) * model_->sample_rate() / 1000;
+
+            for (const auto& window : windows) {
+                auto selected = decode_window(window);
+                if (retry_collapsed_tdt_windows_ &&
+                    selected.owned_end - selected.owned_begin >= 2 * gap_frames &&
+                    offline_detail::has_large_emission_gap(
+                        selected.words, selected.owned_begin, selected.owned_end, gap_frames)) {
+                    struct RetryCandidate {
+                        DecodedWindow decoded;
+                        size_t input_offset;
+                        int direction;
+                    };
+                    std::vector<RetryCandidate> candidates;
+                    for (const int direction : {-1, 1}) {
+                        const auto shifted = offline_detail::shift_window(
+                            window, unpadded_samples, direction * retry_shift_samples);
+                        if (shifted.input_offset == window.input_offset)
+                            continue;
+                        candidates.push_back(
+                            {decode_window(shifted), shifted.input_offset, direction});
+                        retry_passes++;
+                    }
+                    const auto candidate_counts = [&]() {
+                        std::vector<size_t> counts;
+                        counts.reserve(candidates.size());
+                        for (const auto& candidate : candidates)
+                            counts.push_back(candidate.decoded.words.size());
+                        return counts;
+                    };
+
+                    auto counts = candidate_counts();
+                    int retry =
+                        offline_detail::select_consensus_retry(selected.words.size(), counts);
+                    if (retry < 0) {
+                        int recovered = -1;
+                        for (size_t i = 0; i < counts.size(); ++i) {
+                            if (!offline_detail::materially_more_words(
+                                    selected.words.size(), counts[i]))
+                                continue;
+                            if (recovered >= 0) {
+                                recovered = -1;
+                                break;
+                            }
+                            recovered = static_cast<int>(i);
+                        }
+                        if (recovered >= 0) {
+                            const auto& recovery = candidates[static_cast<size_t>(recovered)];
+                            const int direction = 2 * recovery.direction;
+                            const auto shifted = offline_detail::shift_window(
+                                window, unpadded_samples, direction * retry_shift_samples);
+                            const bool duplicate =
+                                shifted.input_offset == window.input_offset ||
+                                std::any_of(
+                                    candidates.begin(), candidates.end(), [&](const auto& prior) {
+                                        return prior.input_offset == shifted.input_offset;
+                                    });
+                            if (!duplicate) {
+                                candidates.push_back(
+                                    {decode_window(shifted), shifted.input_offset, direction});
+                                retry_passes++;
+                                counts = candidate_counts();
+                                retry = offline_detail::select_consensus_retry(
+                                    selected.words.size(), counts);
+                            }
+                        }
+                    }
+                    if (retry >= 0) {
+                        selected = std::move(candidates[static_cast<size_t>(retry)].decoded);
+                        accepted_retries++;
+                    }
+                }
+
+                tokens.insert(tokens.end(), selected.tokens.begin(), selected.tokens.end());
+                for (auto word : selected.words) {
+                    const int64_t global_owned_begin = selected.global_base + selected.owned_begin;
+                    const int64_t global_owned_end = selected.global_base + selected.owned_end;
+                    word.start_frame =
+                        std::max(word.start_frame + selected.global_base, global_owned_begin);
+                    word.end_frame =
+                        std::min(word.end_frame + selected.global_base, global_owned_end);
+                    stitched_words.push_back(std::move(word));
+                }
+                frame_offset += selected.owned_end - selected.owned_begin;
+            }
         }
         if (std::getenv("NEMO_SPEECH_TIMING")) {
             std::fprintf(
-                stderr, "[timing] offline-transducer decode frames=%lld segments=%zu = %.2f ms\n",
-                static_cast<long long>(frame_offset), segments.size(),
+                stderr,
+                "[timing] offline-transducer decode frames=%lld segments=%zu retries=%zu "
+                "retry_passes=%zu = %.2f ms\n",
+                static_cast<long long>(frame_offset), segment_count, accepted_retries, retry_passes,
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - decode_begin)
                     .count());
         }
     }
 
-    decoder->finalize();
+    if (!bounded_tdt)
+        decoder->finalize();
     update.new_token_ids = tokens;
-    update.transcript_so_far = decoder->final_transcript();
-    if (update.transcript_so_far.empty())
-        update.transcript_so_far = detokenize_sentencepiece(tokens, decoder->vocab());
+    if (bounded_tdt) {
+        for (const auto& word : stitched_words) {
+            if (!update.transcript_so_far.empty())
+                update.transcript_so_far.push_back(' ');
+            update.transcript_so_far += word.word;
+        }
+    } else {
+        update.transcript_so_far = decoder->final_transcript();
+        if (update.transcript_so_far.empty())
+            update.transcript_so_far = detokenize_sentencepiece(tokens, decoder->vocab());
+    }
     detected_languages_ = extract_lang_tags(update.transcript_so_far);
-    if (opts_.enable_word_time_offsets)
-        update.words = decoder->word_timings();
-    update.confidence = decoder->confidence();
-    if (opts_.max_alternatives > 1)
-        update.extra_alternatives = decoder->additional_hypotheses(opts_.max_alternatives);
+    if (opts_.enable_word_time_offsets) {
+        if (bounded_tdt)
+            update.words = std::move(stitched_words);
+        else
+            update.words = decoder->word_timings();
+    }
+    if (!bounded_tdt) {
+        update.confidence = decoder->confidence();
+        if (opts_.max_alternatives > 1)
+            update.extra_alternatives = decoder->additional_hypotheses(opts_.max_alternatives);
+    }
     return update;
 }
 

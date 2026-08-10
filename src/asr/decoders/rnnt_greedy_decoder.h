@@ -244,6 +244,7 @@ class TdtGreedyDecoder : public Decoder {
     const std::vector<WordTiming>& word_timings() const override { return words_; }
     void finalize() override;
     int64_t last_emit_frame() const override { return last_emit_frame_; }
+    const std::vector<int64_t>& token_frames() const override { return token_frames_; }
     const RnntDecodeStats& stats() const { return stats_; }
 
    private:
@@ -260,6 +261,7 @@ class TdtGreedyDecoder : public Decoder {
     int pending_skip_ = 0;
     RnntDecodeStats stats_;
     int64_t last_emit_frame_ = -1;
+    std::vector<int64_t> token_frames_;
     bool compute_ts_ = false;
     std::vector<WordTiming> words_;
     bool cur_open_ = false;

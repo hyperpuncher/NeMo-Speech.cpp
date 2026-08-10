@@ -196,6 +196,14 @@ class Decoder {
     // utterances so the endpointer can re-arm); cleared by reset().
     virtual int64_t last_emit_frame() const { return -1; }
 
+    // Encoder emission frame for each token returned by step(), accumulated in
+    // the same order. Used by bounded offline TDT inference to assign overlap
+    // tokens to exactly one window. Other decoders leave this empty.
+    virtual const std::vector<int64_t>& token_frames() const {
+        static const std::vector<int64_t> empty;
+        return empty;
+    }
+
     // Hint: last_emit_frame() will be polled (the runner runs token-silence
     // endpointing on this head). Default no-op - heads that derive the frame as
     // part of their normal decode ignore it; FlashlightDecoder uses it to skip

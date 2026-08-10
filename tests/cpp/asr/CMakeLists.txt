@@ -35,6 +35,10 @@ target_link_libraries(test_audio_decoder PRIVATE nemo_speech_common)
 add_executable(test_decoders test_decoders.cpp)
 target_link_libraries(test_decoders PRIVATE nemo_speech_asr)
 
+add_executable(test_offline_long_form test_offline_long_form.cpp)
+target_link_libraries(test_offline_long_form PRIVATE nemo_speech_asr)
+add_test(NAME offline_long_form COMMAND test_offline_long_form)
+
 # Do not link sentencepiece directly; it is provided by nemo_speech_asr.
 add_executable(test_oov_boost test_oov_boost.cpp)
 target_link_libraries(test_oov_boost PRIVATE nemo_speech_asr)

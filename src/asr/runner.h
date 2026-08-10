@@ -21,6 +21,26 @@ namespace nemo_speech::asr {
 
 struct RecognizerConfig;
 
+namespace offline_detail {
+
+struct Window {
+    size_t input_offset = 0;
+    size_t input_samples = 0;
+    size_t owned_offset = 0;
+    size_t owned_samples = 0;
+};
+
+std::vector<Window> make_windows(
+    size_t audio_samples, size_t chunk_samples, size_t context_samples,
+    size_t min_long_form_samples);
+Window shift_window(const Window& window, size_t audio_samples, int64_t shift_samples);
+bool has_large_emission_gap(
+    const std::vector<WordTiming>& words, int owned_begin, int owned_end, int gap_frames);
+bool materially_more_words(size_t base_words, size_t candidate_words);
+int select_consensus_retry(size_t base_words, const std::vector<size_t>& candidate_words);
+
+}  // namespace offline_detail
+
 // Defined in flashlight_decoder.h; non-flashlight builds hold it null.
 struct FlashlightResources;
 
@@ -234,6 +254,10 @@ class OfflineRunner final : public AsrRunner {
     std::vector<float> audio_;
     int prompt_index_ = -1;
     size_t bucket_samples_ = 0;  // BatchingConfig::offline_bucket_ms in samples; 0 = off
+    size_t tdt_chunk_samples_ = 0;
+    size_t tdt_context_samples_ = 0;
+    size_t tdt_min_long_form_samples_ = 0;
+    bool retry_collapsed_tdt_windows_ = true;
     bool finalized_ = false;
     std::vector<std::string> detected_languages_;
 };

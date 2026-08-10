@@ -358,6 +358,7 @@ TdtGreedyDecoder::reset() {
     pending_skip_ = 0;
     stats_ = {};
     last_emit_frame_ = -1;
+    token_frames_.clear();
     words_.clear();
     cur_open_ = false;
     cur_ = WordTiming{};
@@ -434,6 +435,7 @@ TdtGreedyDecoder::step(const float* enc_out, int d_model, int T, int64_t frame_o
 
             if (token != cfg.blank_id) {
                 emitted.push_back(token);
+                token_frames_.push_back(frame_offset + t);
                 ++stats_.emitted_tokens;
                 last_emit_frame_ = frame_offset + t;
                 if (compute_ts_ && token >= 0 &&

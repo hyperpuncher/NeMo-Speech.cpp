@@ -559,6 +559,9 @@ test_tdt_duration_and_state_commit() {
     const auto ids = dec.step(enc.data(), 2, 5, 10);
     dec.finalize();
     check(ids == std::vector<int>({0, 1}), "tdt: token and duration sequence");
+    check(
+        dec.token_frames() == std::vector<int64_t>({10, 13}),
+        "tdt: token frames parallel emitted tokens");
     check(eng.predictor_calls == 2, "tdt: predictor commits only on non-blank");
     check(dec.last_emit_frame() == 13, "tdt: duration advances encoder frame");
     const auto& words = dec.word_timings();

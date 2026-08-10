@@ -32,11 +32,37 @@ struct BackendConfig {
     }
 };
 
+struct OfflineConfig {
+    // Long TDT recordings use fixed full-context encoder windows. Each window
+    // is decoded independently, then words are assigned to its owned center.
+    // Set chunk_ms to 0 to retain full-utterance offline inference.
+    int chunk_ms = 20000;
+    int context_ms = 3500;
+    int min_long_form_ms = 180000;
+    bool retry_collapsed_windows = true;
+
+    void Register(common::ParameterParser& p) {
+        p.Register(
+            "chunk_ms", &chunk_ms,
+            "Owned duration of each long-form offline TDT window (0 = disabled)");
+        p.Register(
+            "context_ms", &context_ms,
+            "Additional encoder context on each side of a long-form TDT chunk");
+        p.Register(
+            "min_long_form_ms", &min_long_form_ms,
+            "Minimum TDT recording duration before bounded long-form inference activates");
+        p.Register(
+            "retry_collapsed_windows", &retry_collapsed_windows,
+            "Retry anomalously incomplete long-form TDT windows at shifted boundaries");
+    }
+};
+
 // Startup configuration; per-request options live in AsrRequestOptions.
 struct RecognizerConfig {
     BackendConfig backend;
     BatchingConfig batching;
     ModelConfig model;
+    OfflineConfig offline;
     StreamingConfig streaming;  // chunk/padding geometry + cache-aware R
     DecoderConfig decoder;
     VadConfig vad;
@@ -48,6 +74,7 @@ struct RecognizerConfig {
         p.Register("backend", backend);
         p.Register("batching", batching);
         p.Register("model", model);
+        p.Register("offline", offline);
         p.Register("streaming", streaming);
         p.Register("decoder", decoder);
         p.Register("vad", vad);
